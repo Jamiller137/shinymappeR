@@ -6,11 +6,26 @@
 #    https://shiny.posit.co/
 #
 
-library(shiny)
-library(devtools)
-library(mappeR)
-library(stats)
-library(mclust) #install this
+# Make sure packages are installed!
+
+required_packages <- c("shiny", "shinyjs", "devtools", "stats", "mclust", "nortest", "mappeR")
+
+
+install_if_missing <- function(packages) {
+  missing_packages <- packages[!sapply(packages, requireNamespace, quietly = TRUE)]
+  if (length(missing_packages) > 0) {
+    message("Installing missing packages: ", paste(missing_packages, collapse = ", "))
+    install.packages(missing_packages)
+  }
+
+  # Load all packages
+  for (package in packages) {
+    library(package, character.only = TRUE)
+  }
+}
+
+# install/load all required packages
+install_if_missing(required_packages)
 
 # stolen from sir jacob miller
 generate_spiral <- function(n=1000, noise=0.1){
@@ -42,24 +57,26 @@ generate_barbell <- function(n) {
 }
 
 # Define UI for application that constructs mapper graph
+
 ui <- fluidPage(
+    useShinyjs(),
     titlePanel("1D Mapper"),
 
     # Sidebar with parameter input options
     sidebarLayout(
         sidebarPanel(
-            selectInput( # this is a drop down list
-                "data", # internal variable name
-                "Dataset", # display name
-                choices = c("circle", "figure 8", "spiral", "barbell") # choices for drop down
+            selectInput(
+                "data",
+                "Dataset",
+                choices = c("circle", "figure 8", "spiral", "barbell")
             ),
-            sliderInput( # this is a slider
-                "points", # internal variable name
-                "Number of points", # display name
-                value = 1000, # initial value
-                min = 100, # min value
-                max = 2000, # max value
-                step = 100 # step size for slider bar
+            sliderInput(
+                "points",
+                "Number of points",
+                value = 1000,
+                min = 100,
+                max = 2000,
+                step = 100
             ),
             selectInput(
                 "cover_type",
@@ -71,26 +88,55 @@ ui <- fluidPage(
                 "Lens Function: ",
                 choices = c("project to x", "project to y", "use eccentricity value", "PCA-1")
             ),
-            sliderInput(
-                "bins",
-                "Number of bins:",
-                min = 1,
-                max = 50,
-                value = 10
+
+            # we only show bins slider for Width-Balanced and GMM-based
+            conditionalPanel(
+                condition = "input.cover_type != 'G-Mapper'",
+                sliderInput(
+                    "bins",
+                    "Number of bins:",
+                    min = 1,
+                    max = 50,
+                    value = 10
+                )
             ),
+
+            # G-Mapper parameters
+            conditionalPanel(
+                condition = "input.cover_type == 'G-Mapper'",
+                sliderInput(
+                    "alpha",
+                    "Alpha (significance level):",
+                    min = 0.001,
+                    max = 0.2,
+                    value = 0.05,
+                    step = 0.001
+                ),
+                sliderInput(
+                    "min_points_percent",
+                    "Minimum points per interval (% of total):",
+                    min = 1,
+                    max = 50,
+                    value = 10,
+                    step = 0.5
+                ),
+                sliderInput(
+                    "max_iterations",
+                    "Maximum iterations:",
+                    min = 5,
+                    max = 50,
+                    value = 20
+                ),
+                htmlOutput("gmapper_bins_info")
+            ),
+            
             sliderInput(
                 "percent_overlap",
-                "Percent overlap:",
+                "Percent overlap (weight):",
                 min = 0,
                 max = 100,
                 value = 25
             ),
-            sliderInput("prob_threshold",
-            "Probability Threshold:",
-            min=0.001,
-            max=.5,
-            value=0.05,
-            step=0.001),
 
             selectInput(
                 "method",
@@ -101,7 +147,9 @@ ui <- fluidPage(
 
         # plot mapper graph
         mainPanel(plotOutput("inputdata"), plotOutput("mapper"))
-    ))
+    )
+)
+
 
 # Define server logic required to construct mapper graph
 server <- function(input, output, session) {
@@ -139,21 +187,154 @@ server <- function(input, output, session) {
 
 # A reactive expression for the 'G-Mapper' covering scheme
 # Should now only compute the model when needed
+
+    # number of bins display for G-Mapper setting
+    output$gmapper_bins_info <- renderUI({
+        if(input$cover_type == "G-Mapper" && !is.null(gmapper_model())) {
+            bin_count <- nrow(gmapper_model()$intervals)
+            HTML(paste0(
+                "<div style='margin-top: 20px; margin-bottom: 20px; padding: 10px; background-color: #6ae106; border-radius: 10px;'>",
+                "<strong>G-Mapper determined ", bin_count, " bins</strong>",
+                "</div>"
+            ))
+        }
+    })
+
     gmapper_model <- reactive({
         if(input$cover_type == "G-Mapper") {
-            if (!require("mclust")) {
-                install.packages("mclust")
-                library(mclust)
+
+            # G-Means algorithm for cover generation
+
+            g_means_cover <- function(filtered_data, alpha, min_points_percent, max_iterations) {
+                # Calculate minimum points based on percentage of total data
+                total_points <- length(filtered_data)
+                min_points <- max(30, round(total_points * min_points_percent / 100))
+
+                # initialize with a single interval
+                data_range <- range(filtered_data)
+                intervals <- matrix(data_range, nrow=1, ncol=2)
+                means <- mean(filtered_data)
+                variances <- var(filtered_data)
+
+                # Keeps track if intervals need testing
+                to_test <- TRUE
+                iteration <- 0 # will eventually halt
+
+                while(any(to_test) && iteration < max_iterations) {
+                    iteration <- iteration + 1
+                    current_intervals <- intervals[to_test, , drop=FALSE]
+                    new_intervals <- list()
+                    new_means <- c()
+                    new_variances <- c()
+                    new_to_test <- c()
+
+                    for(i in 1:nrow(current_intervals)) {
+                        interval <- current_intervals[i, ]
+                        # Get data in this interval
+                        interval_data <- filtered_data[filtered_data >= interval[1] & filtered_data <= interval[2]]
+
+                        if(length(interval_data) < min_points) { # Not enough points to test
+                            new_intervals[[length(new_intervals) + 1]] <- interval
+                            new_means <- c(new_means, mean(interval_data))
+                            new_variances <- c(new_variances, var(interval_data))
+                            new_to_test <- c(new_to_test, FALSE)
+                            next
+                        }
+
+                        # Normalize data for AD
+                        normalized_data <- (interval_data - mean(interval_data)) / sqrt(var(interval_data))
+
+                        # Anderson-Darling test for normality
+                        ad_test <- ad.test(normalized_data)
+
+                        if(ad_test$p.value < alpha) { # Not normal => split the interval
+                            # 2-component GMM
+                            data_matrix <- as.matrix(interval_data)
+                            gmm <- Mclust(data_matrix, G=2, modelNames="V")
+
+                            if(!is.null(gmm) && length(gmm$parameters$mean) == 2) {
+                                # get the means and sort
+                                gmm_means <- gmm$parameters$mean
+                                gmm_vars <- gmm$parameters$variance$sigmasq
+                                sorted_idx <- order(gmm_means)
+                                gmm_means <- gmm_means[sorted_idx]
+                                gmm_vars <- gmm_vars[sorted_idx]
+
+                                # Split point (weighted by variances)
+                                split_point <- (gmm_means[1] * sqrt(gmm_vars[2]) + gmm_means[2] * sqrt(gmm_vars[1])) / 
+                                                (sqrt(gmm_vars[1]) + sqrt(gmm_vars[2]))
+
+                                # split into two new intervals in cover
+                                new_intervals[[length(new_intervals) + 1]] <- c(interval[1], split_point)
+                                new_intervals[[length(new_intervals) + 1]] <- c(split_point, interval[2])
+
+                                # find means and variances for the new intervals
+                                left_data <- interval_data[interval_data <= split_point]
+                                right_data <- interval_data[interval_data > split_point]
+
+                                new_means <- c(new_means, mean(left_data), mean(right_data))
+                                new_variances <- c(new_variances, var(left_data), var(right_data))
+
+                                # mark new intervals for testing
+                                new_to_test <- c(new_to_test, TRUE, TRUE)
+                            } else {
+                                # if GMM fitting fails, keep the original interval
+                                new_intervals[[length(new_intervals) + 1]] <- interval
+                                new_means <- c(new_means, mean(interval_data))
+                                new_variances <- c(new_variances, var(interval_data))
+                                new_to_test <- c(new_to_test, FALSE)
+                            }
+                        } else {
+                            # if AD determines ~ normal, keep the interval
+                            new_intervals[[length(new_intervals) + 1]] <- interval
+                            new_means <- c(new_means, mean(interval_data))
+                            new_variances <- c(new_variances, var(interval_data))
+                            new_to_test <- c(new_to_test, FALSE)
+                        }
+                    }
+
+                    # Update intervals that weren't tested
+                    if(any(!to_test)) {
+                        untested_intervals <- intervals[!to_test, , drop=FALSE]
+                        untested_means <- means[!to_test]
+                        untested_vars <- variances[!to_test]
+
+                        # combine with new intervals
+                        intervals <- rbind(do.call(rbind, new_intervals), untested_intervals)
+                        means <- c(new_means, untested_means)
+                        variances <- c(new_variances, untested_vars)
+                        to_test <- c(new_to_test, rep(FALSE, sum(!to_test)))
+                    } else {
+                        intervals <- do.call(rbind, new_intervals)
+                        means <- new_means
+                        variances <- new_variances
+                        to_test <- new_to_test
+                    }
+
+                    # intervals sorted by LOWER bound
+                    sort_idx <- order(intervals[,1])
+                    intervals <- intervals[sort_idx, , drop=FALSE]
+                    means <- means[sort_idx]
+                    variances <- variances[sort_idx]
+                    to_test <- to_test[sort_idx]
+                }
+
+                # results returned as a list
+                return(list(
+                    intervals = intervals,
+                    means = means,
+                    variances = variances
+                ))
             }
-            # format required by mclust
-            data_matrix <- as.matrix(filtered_data())
 
-            max_components <- min(100, length(filtered_data()) / 10) # completely arbitrary
-
-            prob_threshold <- input$prob_threshold
-
-            # "V" - uses univariate model with variable variance
-            Mclust(data_matrix, G=1:max_components, modelNames="V")
+            # run G-Means
+            g_means_result <- g_means_cover(
+                filtered_data(), 
+                alpha = input$alpha, 
+                min_points_percent = input$min_points_percent, 
+                max_iterations = input$max_iterations
+            )
+            return(g_means_result)
         } else {
             NULL
         }
@@ -163,9 +344,7 @@ server <- function(input, output, session) {
     # updates the bins slider when G-Mapper model changes
     observe({
         if(input$cover_type == "G-Mapper" && !is.null(gmapper_model())) {
-
-            n_components <- length(gmapper_model()$parameters$mean)
-
+            n_components <- nrow(gmapper_model()$intervals)
             updateSliderInput(session, "bins", value = n_components)
         }
     })
@@ -174,145 +353,98 @@ server <- function(input, output, session) {
 
     # generate cover
     cover = reactive({
+    # grab current data
+    data = data()
 
-        if(input$cover_type == "G-Mapper") {
-            prob_threshold <- input$prob_threshold
-        }
+    # grab current filter values
+    filtered_data = filtered_data()
 
-        # grab current data
-        data = data()
-
-        # grab current filter values
-        filtered_data = filtered_data()
-
-        # create cover based on user selection
-        switch(input$cover_type,
-                "Width-Balanced" = create_width_balanced_cover(min(filtered_data),
-                                    max(filtered_data),
-                                    input$bins,
-                                    input$percent_overlap),
-                "GMM-based" = {
-                    if (!require("mclust")) {
-                        install.packages("mclust")
-                        library(mclust)
-                    }
-                    # define the functions:
-                    fit_gmm <- function(filtered_data, n_components) {
-                        data_matrix <- as.matrix(filtered_data)
-
-                        # Fit GMM to 1D-filtered values
-                        # Force "V" model (variable variance, univariate)
-                        gmm_model <- Mclust(data_matrix, G=n_components, modelNames="V")
-                        return(gmm_model)
-                    }
-
-                    create_gmm_cover <- function(filtered_data, gmm_model, percent_overlap) {
-                        means <- gmm_model$parameters$mean
-                        variances <- gmm_model$parameters$variance$sigmasq
-                        sorted_indices <- order(means)
-                        sorted_means <- means[sorted_indices]
-                        sorted_variances <- variances[sorted_indices]
-
-                        intervals <- matrix(0, nrow=length(sorted_means), ncol=2)
-
-                        for (i in 1:length(sorted_means)) {
-                            std_dev <- sqrt(sorted_variances[i])
-
-                            intervals[i,] <- c(sorted_means[i] - 2*std_dev, sorted_means[i] + 2*std_dev)
-                        }
-
-                        for(j in 2:length(sorted_means)){
-                            midpoint <- (sorted_means[j] + sorted_means[j-1])/2
-                            overlap_distance <- percent_overlap*(sorted_means[j] - sorted_means[j-1])/100
-                            intervals[j-1, 2] <- midpoint + overlap_distance
-                            intervals[j, 1] <- midpoint - overlap_distance
-
-                        }
-
-                        intervals[1,1] <- min(filtered_data)
-                        intervals[length(sorted_means), 2] <- max(filtered_data)
-
-                        return(intervals)
-
-                    }
-                    gmm_result <- fit_gmm(filtered_data, input$bins)
-                    create_gmm_cover(filtered_data, gmm_result, input$percent_overlap)
-                },
-
-                "G-Mapper" = {
-                    # Get the pre-computed GMM model from the reactive expression
-                    model <- gmapper_model()
-
-                    # NOTE: fit_gmapper() is defined but is not used since we are using the version from gmapper_model()
-                    # I am only including it for posterity
-                    fit_gmapper <- function(filtered_data) {
-                        data_matrix <- as.matrix(filtered_data)
-
-                        # Fits GMM with automatic selection of number of components using BIC
-                        max_components <- min(100, length(filtered_data) / 10)
-                        gmapper_model <- Mclust(data_matrix, G=1:max_components, modelNames="V")
-                        return(gmapper_model)
-                    }
-
-                    # creates cover intervals based on GMM components
-                    create_gmapper_cover <- function(filtered_data, gmapper_model, percent_overlap, prob_threshold) {
-                        # get model parameters
-                        means <- gmapper_model$parameters$mean
-                        variances <- gmapper_model$parameters$variance$sigmasq
-                        weights <- gmapper_model$parameters$pro
-
-                        sorted_indices <- order(means)
-                        sorted_means <- means[sorted_indices]
-                        sorted_variances <- variances[sorted_indices]
-                        sorted_weights <- weights[sorted_indices]
-
-                        # Initialize intervals matrix
-                        intervals <- matrix(0, nrow=length(sorted_means), ncol=2)
-
-                        # Create intervals based on probability density
-                        for (i in 1:length(sorted_means)) {
-                            std_dev <- sqrt(sorted_variances[i])
-
-                            # creates intervals containing the inner (1-prob_threshold) of the mass for each gaussian
-                            q_low <- qnorm(prob_threshold/2, mean=sorted_means[i], sd=std_dev)
-                            q_high <- qnorm(1-prob_threshold/2, mean=sorted_means[i], sd=std_dev)
-
-                            intervals[i,] <- c(q_low, q_high)
-                        }
-
-                        # adjust intervals for overlap
-                        for(j in 2:length(sorted_means)) {
-
-                            midpoint <- (sorted_means[j] + sorted_means[j-1])/2
-
-                            sd_left <- sqrt(sorted_variances[j-1])
-                            sd_right <- sqrt(sorted_variances[j])
-
-                            # overlap is dependent on user specified percent overlap and is weighted by the standard deviations of adjacent components
-                            overlap_factor <- percent_overlap *
-                                            (sd_left * sorted_weights[j-1] + sd_right * sorted_weights[j]) /
-                                            (sorted_weights[j-1] + sorted_weights[j])
-
-                            # adjust interval bounds to ensure proper overlap
-                            intervals[j-1, 2] <- midpoint + overlap_factor
-                            intervals[j, 1] <- midpoint - overlap_factor
-                        }
-
-                        # make sure the cover spans
-                        intervals[1,1] <- min(filtered_data)
-                        intervals[length(sorted_means), 2] <- max(filtered_data)
-
-                        return(intervals)
-                    }
-
-                    prob_threshold <- input$prob_threshold
-
-                    n_components <- length(model$parameters$mean)
-
-                    create_gmapper_cover(filtered_data,model, input$percent_overlap/100, prob_threshold)
+    # create cover based on user selection
+    switch(input$cover_type,
+            "Width-Balanced" = create_width_balanced_cover(min(filtered_data),
+                                max(filtered_data),
+                                input$bins,
+                                input$percent_overlap),
+            "GMM-based" = {
+                if (!require("mclust")) {
+                    install.packages("mclust")
+                    library(mclust)
                 }
-        )
-    })
+                # define the functions:
+                fit_gmm <- function(filtered_data, n_components) {
+                    data_matrix <- as.matrix(filtered_data)
+
+                    # Fit a GMM to 1D-filtered values
+                    # "V" model (variable variance, univariate)
+                    gmm_model <- Mclust(data_matrix, G=n_components, modelNames="V")
+                    return(gmm_model)
+                }
+
+                create_gmm_cover <- function(filtered_data, gmm_model, percent_overlap) {
+                    # grab variables
+                    means <- gmm_model$parameters$mean
+                    variances <- gmm_model$parameters$variance$sigmasq
+                    sorted_indices <- order(means)
+                    sorted_means <- means[sorted_indices]
+                    sorted_variances <- variances[sorted_indices]
+                    intervals <- matrix(0, nrow=length(sorted_means), ncol=2)
+
+                    # interval lengths weighted by std_deviations and user specified overlap
+                    for (i in 1:length(sorted_means)) {
+                        std_dev <- sqrt(sorted_variances[i])
+
+                        intervals[i,] <- c(sorted_means[i] - 2*std_dev, sorted_means[i] + 2*std_dev)
+                    }
+
+                    for(j in 2:length(sorted_means)){
+                        midpoint <- (sorted_means[j] + sorted_means[j-1])/2
+                        overlap_distance <- percent_overlap*(sorted_means[j] - sorted_means[j-1])/100
+                        intervals[j-1, 2] <- midpoint + overlap_distance
+                        intervals[j, 1] <- midpoint - overlap_distance
+
+                    }
+
+                    intervals[1,1] <- min(filtered_data)
+                    intervals[length(sorted_means), 2] <- max(filtered_data)
+
+                    return(intervals)
+                }
+                # create the actual cover
+                gmm_result <- fit_gmm(filtered_data, input$bins)
+                create_gmm_cover(filtered_data, gmm_result, input$percent_overlap)
+            },
+            "G-Mapper" = {
+                # pre-computed G-Means model
+                model <- gmapper_model()
+
+                # create proper overlap weighted similarly to GMM-based
+                create_gmapper_cover <- function(model, percent_overlap) {
+                    intervals <- model$intervals
+                    means <- model$means
+                    variances <- model$variances
+
+                    # Adjust intervals for overlap
+                    for(j in 2:length(means)) {
+
+                        midpoint <- (means[j] + means[j-1])/2
+
+                        sd_left <- sqrt(variances[j-1])
+                        sd_right <- sqrt(variances[j])
+
+                        r <- sd_right / sd_left
+                        overlap_factor <- percent_overlap * (r * sd_left + sd_right) / (r + 1) / 100
+
+                        intervals[j-1, 2] <- midpoint + overlap_factor
+                        intervals[j, 1] <- midpoint - overlap_factor
+                    }
+
+                    return(intervals)
+                }
+
+                create_gmapper_cover(model, input$percent_overlap)
+            }
+    )
+})
 
     # generate mapper graph
     mapper = reactive({
